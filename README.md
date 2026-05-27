@@ -1,36 +1,51 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Keka Tracker
 
-## Getting Started
+Personal dashboard: **hours complete (inside office)** and **remaining**, refreshed every **30 seconds**, using your Keka tokens and the **`summary`** API from the Keka web app.
 
-First, run the development server:
+## Which Keka API to use?
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+From your Network tab (Fetch/XHR), you only need **one main endpoint**:
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+| Priority | Name in Network tab | Purpose |
+|----------|---------------------|---------|
+| **Required** | `summary` | Today's worked + remaining hours (what Keka shows on attendance) |
+| Optional | `attendancesettings` / `trackingpolicy` | Only if you need to read shift length instead of `KEKA_TARGET_HOURS` |
+| Not needed for v1 | `collect`, `upcoming`, `policy`, `shiftweekoffdetails`, etc. | UI metadata, not hour totals |
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Setup
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+1. Copy env file:
 
-## Learn More
+   ```bash
+   cp .env.example .env.local
+   ```
 
-To learn more about Next.js, take a look at the following resources:
+2. In Keka (logged in), open **DevTools → Network → Fetch/XHR**.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+3. Click the **`summary`** request:
+   - Copy **Request URL** → set `KEKA_BASE_URL` + `KEKA_SUMMARY_PATH`
+   - Copy **Authorization** bearer token → `KEKA_ACCESS_TOKEN` (temporary until refresh works)
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+4. Find a **`connect/token`** (or similar) refresh request:
+   - Copy `refresh_token` into `.env.local`
+   - If your access token expires and auto-refresh stops working, then also copy `client_id` and `client_secret`
+   - Copy token URL → `KEKA_TOKEN_URL`
 
-## Deploy on Vercel
+5. If the summary request has extra headers (Origin, Referer, etc.), add them to `KEKA_EXTRA_HEADERS` as JSON.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+6. Run:
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+   ```bash
+   npm install
+   npm run dev
+   ```
+
+Open [http://localhost:3000](http://localhost:3000).
+
+Refreshed tokens are saved in `.keka-tokens.json` (gitignored).
+
+## Troubleshooting
+
+- **401 / 403**: Wrong or expired token — update `KEKA_ACCESS_TOKEN`. If tokens expire and refresh doesn’t work, add `KEKA_CLIENT_ID` / `KEKA_CLIENT_SECRET`.
+- **404 on summary**: `KEKA_SUMMARY_PATH` must match DevTools exactly.
+- **Wrong hours**: Open summary **Response** in DevTools; if field names differ, we auto-detect common names — set `KEKA_TARGET_HOURS` to your shift length (e.g. `9`).
