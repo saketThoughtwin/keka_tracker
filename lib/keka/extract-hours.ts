@@ -9,6 +9,8 @@ const REMAINING_KEY =
 const TARGET_KEY =
   /(shiftEffectiveDuration|shift.*effective.*duration|required|expected|target|policy|minimum|standard).*?(hour|minute|time|duration)/i;
 
+type Punch = { epochMs: number; status: 0 | 1 };
+
 function walk(
   node: unknown,
   matches: RegExp,
@@ -44,6 +46,86 @@ function pickBest(candidates: number[], preferAround?: number): number | null {
   return unique[unique.length - 1];
 }
 
+function parsePunches(
+  timeEntries: unknown[],
+  timeZone: string,
+): Punch[] {
+  return timeEntries
+    .map((e) => {
+      if (!e || typeof e !== "object") return null;
+      const entry = e as Record<string, unknown>;
+      if (entry.isDeleted === true) return null;
+
+      const ts =
+        typeof entry.timestamp === "string"
+          ? entry.timestamp
+          : typeof entry.actualTimestamp === "string"
+            ? entry.actualTimestamp
+            : null;
+      const epochMs = ts != null ? parseKekaTimestamp(ts, timeZone) : null;
+      if (epochMs == null) return null;
+
+      // Use punchStatus only — Keka's effective inside/outside is based on this.
+      const statusRaw =
+        typeof entry.punchStatus === "number" ? entry.punchStatus : null;
+      if (statusRaw !== 0 && statusRaw !== 1) return null;
+
+      return { epochMs, status: statusRaw as 0 | 1 };
+    })
+    .filter((p): p is Punch => p != null)
+    .sort((a, b) => a.epochMs - b.epochMs);
+}
+
+/** Sum closed IN→OUT pairs (Keka effective hours, excludes breaks). */
+function sumValidInOutPairsMs(row: Record<string, unknown>): number {
+  const pairs = row.validInOutPairs;
+  if (!Array.isArray(pairs)) return 0;
+
+  return pairs.reduce((acc, p) => {
+    if (p && typeof p === "object" && typeof (p as { totalDuration?: unknown }).totalDuration === "number") {
+      return acc + (p as { totalDuration: number }).totalDuration * 3_600_000;
+    }
+    return acc;
+  }, 0);
+}
+
+/** Replay inside (IN→OUT) and outside (OUT→IN) segments from punches. */
+function replayFromPunches(punches: Punch[], nowMs: number) {
+  let insideMs = 0;
+  let outsideMs = 0;
+  let currentInEpochMs: number | null = null;
+  let breakStartEpochMs: number | null = null;
+
+  for (const p of punches) {
+    if (p.status === 0) {
+      if (breakStartEpochMs != null) {
+        outsideMs += p.epochMs - breakStartEpochMs;
+        breakStartEpochMs = null;
+      }
+      if (currentInEpochMs == null) {
+        currentInEpochMs = p.epochMs;
+      }
+    } else {
+      if (currentInEpochMs != null) {
+        insideMs += p.epochMs - currentInEpochMs;
+        currentInEpochMs = null;
+      }
+      breakStartEpochMs = p.epochMs;
+    }
+  }
+
+  const last = punches.at(-1);
+  if (last?.status === 0 && currentInEpochMs != null) {
+    // Still inside — extend effective time only while last punch is IN.
+    insideMs += nowMs - currentInEpochMs;
+  } else if (last?.status === 1 && breakStartEpochMs != null) {
+    // On break — extend outside only; effective (inside) must not grow.
+    outsideMs += nowMs - breakStartEpochMs;
+  }
+
+  return { insideMs, outsideMs, last };
+}
+
 export type ExtractedHours = {
   completedMinutes: number;
   remainingMinutes: number;
@@ -54,6 +136,7 @@ export type ExtractedHours = {
   currentlyOutside: boolean;
   timeToHomeMinutes: number | null;
   source:
+    | "computed-from-validInOutPairs"
     | "computed-from-timeEntries"
     | "summary-fields"
     | "computed-from-fallback";
@@ -87,162 +170,61 @@ export function extractHoursFromSummary(
       ? row.shiftEffectiveDuration
       : null;
 
-  // If user explicitly configured a target (e.g., 8h effective), prefer that
-  // over Keka's shiftEffectiveDuration (which is often 9h).
-  const targetMinutes =
-    targetMinutesIsExplicit
-      ? Math.max(0, Math.round(fallbackTargetMinutes))
-      : shiftEffectiveDuration != null
-        ? Math.max(0, Math.round(shiftEffectiveDuration * 60))
-        : Math.max(0, Math.round(fallbackTargetMinutes));
+  const targetMinutes = targetMinutesIsExplicit
+    ? Math.max(0, Math.round(fallbackTargetMinutes))
+    : shiftEffectiveDuration != null
+      ? Math.max(0, Math.round(shiftEffectiveDuration * 60))
+      : Math.max(0, Math.round(fallbackTargetMinutes));
 
-  const shiftEndTime =
-    (typeof row.shiftEndTime === "string" ? row.shiftEndTime : null) ??
-    (typeof row.shiftSlotEndTime === "string" ? row.shiftSlotEndTime : null);
-  const shiftEndEpochMs =
-    shiftEndTime != null ? parseKekaTimestamp(shiftEndTime, timeZone) : null;
-
-  const timeToHomeMinutes =
-    shiftEndEpochMs != null
-      ? Math.max(0, Math.round((shiftEndEpochMs - nowMs) / 60_000))
-      : null;
-
-  // 1) Preferred: compute effective + outside using `timeEntries` (IN=0, OUT=1).
   const timeEntries = Array.isArray(row.timeEntries)
     ? (row.timeEntries as unknown[])
     : null;
 
-  if (timeEntries && timeEntries.length > 0) {
-    type Punch = { epochMs: number; status: 0 | 1 };
+  const punches =
+    timeEntries && timeEntries.length > 0
+      ? parsePunches(timeEntries, timeZone)
+      : [];
 
-    const punches: Punch[] = timeEntries
-      .map((e) => {
-        if (!e || typeof e !== "object") return null;
-        const entry = e as Record<string, unknown>;
+  const closedInsideMs = sumValidInOutPairsMs(row);
+  const hasPairs = closedInsideMs > 0;
 
-        const ts =
-          typeof entry.timestamp === "string"
-            ? entry.timestamp
-            : typeof entry.actualTimestamp === "string"
-              ? entry.actualTimestamp
-              : null;
-        const epochMs = ts != null ? parseKekaTimestamp(ts, timeZone) : null;
-        if (epochMs == null) return null;
+  if (punches.length > 0) {
+    const last = punches.at(-1)!;
+    const currentlyOutside = last.status === 1;
 
-        const statusRaw =
-          typeof entry.punchStatus === "number"
-            ? entry.punchStatus
-            : typeof entry.modifiedPunchStatus === "number"
-              ? entry.modifiedPunchStatus
-              : typeof entry.originalPunchStatus === "number"
-                ? entry.originalPunchStatus
-                : null;
-        if (statusRaw !== 0 && statusRaw !== 1) return null;
+    let insideMs: number;
+    let outsideMs: number;
+    let source: ExtractedHours["source"];
 
-        return { epochMs, status: statusRaw as 0 | 1 };
-      })
-      .filter((p): p is Punch => p != null);
-
-    punches.sort((a, b) => a.epochMs - b.epochMs);
-    if (punches.length > 0) {
-      let insideMs = 0;
-      let outsideMs = 0;
-
-      let currentInEpochMs: number | null = null;
-      let breakStartEpochMs: number | null = null; // last OUT
-      let lastOutEpochMs: number | null = null;
-
-      let lastBreakDurationMinutes: number | null = null;
-      let currentlyOutside = false;
-
-      // When we see OUT after IN => close inside segment and start break segment.
-      // When we see IN while on break => close break segment.
-      for (const p of punches) {
-        if (p.status === 0) {
-          // IN
-          if (currentInEpochMs == null) {
-            currentInEpochMs = p.epochMs;
-          } else {
-            // Another IN without an OUT; treat as the new start.
-            currentInEpochMs = p.epochMs;
-          }
-
-          if (breakStartEpochMs != null) {
-            outsideMs += p.epochMs - breakStartEpochMs;
-            lastOutEpochMs = breakStartEpochMs;
-            lastBreakDurationMinutes = Math.max(
-              0,
-              Math.round((p.epochMs - breakStartEpochMs) / 60_000),
-            );
-            breakStartEpochMs = null;
-            currentlyOutside = false;
-          }
-        } else {
-          // OUT
-          if (currentInEpochMs != null) {
-            insideMs += p.epochMs - currentInEpochMs;
-            currentInEpochMs = null;
-          }
-
-          breakStartEpochMs = p.epochMs;
-          lastOutEpochMs = p.epochMs;
-          currentlyOutside = true;
-        }
+    if (hasPairs) {
+      // Effective hours = closed pairs only; add live segment only if still IN.
+      insideMs = closedInsideMs;
+      if (last.status === 0) {
+        insideMs += nowMs - last.epochMs;
       }
-
-      if (currentInEpochMs != null) {
-        insideMs += nowMs - currentInEpochMs;
-      }
-
-      if (breakStartEpochMs != null) {
-        outsideMs += nowMs - breakStartEpochMs;
-        lastBreakDurationMinutes = Math.max(
-          0,
-          Math.round((nowMs - breakStartEpochMs) / 60_000),
-        );
-        currentlyOutside = true;
-      }
-
-      const completedMinutes = Math.max(0, Math.round(insideMs / 60_000));
-      const outsideMinutes = Math.max(0, Math.round(outsideMs / 60_000));
-      const remainingMinutes = Math.max(0, targetMinutes - completedMinutes);
-
-      return {
-        completedMinutes,
-        remainingMinutes,
-        targetMinutes,
-        outsideMinutes,
-        lastOutEpochMs,
-        lastBreakDurationMinutes,
-        currentlyOutside,
-        timeToHomeMinutes,
-        source: "computed-from-timeEntries",
-      };
+      const replay = replayFromPunches(punches, nowMs);
+      outsideMs = replay.outsideMs;
+      source = "computed-from-validInOutPairs";
+    } else {
+      const replay = replayFromPunches(punches, nowMs);
+      insideMs = replay.insideMs;
+      outsideMs = replay.outsideMs;
+      source = "computed-from-timeEntries";
     }
-  }
 
-  // 2) If timeEntries are missing, use summary fields (effective/shift duration).
-  const totalEffectiveHours =
-    typeof row.totalEffectiveHours === "number" ? row.totalEffectiveHours : null;
-  if (totalEffectiveHours != null && shiftEffectiveDuration != null) {
-    const completedMinutes = Math.max(
-      0,
-      Math.round(totalEffectiveHours * 60),
-    );
-    const remainingMinutes = Math.max(0, targetMinutes - completedMinutes);
-    const outsideMinutes =
-      typeof row.totalBreakDuration === "number"
-        ? Math.max(0, Math.round((row.totalBreakDuration as number) * 60))
-        : 0;
     const lastOutEpochMs =
-      typeof row.lastOutOfTheDay === "string"
-        ? parseKekaTimestamp(row.lastOutOfTheDay, timeZone)
-        : null;
+      last.status === 1
+        ? last.epochMs
+        : punches.filter((p) => p.status === 1).at(-1)?.epochMs ?? null;
+
     const lastBreakDurationMinutes =
-      typeof row.totalBreakDuration === "number"
-        ? Math.max(0, Math.round((row.totalBreakDuration as number) * 60))
+      currentlyOutside && lastOutEpochMs != null
+        ? Math.max(0, Math.round((nowMs - lastOutEpochMs) / 60_000))
         : null;
-    const currentlyOutside = typeof row.lastOutOfTheDay === "string" && row.lastOutOfTheDay != null;
+
+    const completedMinutes = Math.max(0, Math.round(insideMs / 60_000));
+    const outsideMinutes = Math.max(0, Math.round(outsideMs / 60_000));
+    const remainingMinutes = Math.max(0, targetMinutes - completedMinutes);
 
     return {
       completedMinutes,
@@ -252,12 +234,48 @@ export function extractHoursFromSummary(
       lastOutEpochMs,
       lastBreakDurationMinutes,
       currentlyOutside,
-      timeToHomeMinutes,
+      timeToHomeMinutes: null,
+      source,
+    };
+  }
+
+  const totalEffectiveHours =
+    typeof row.totalEffectiveHours === "number" ? row.totalEffectiveHours : null;
+  if (totalEffectiveHours != null) {
+    const completedMinutes = Math.max(
+      0,
+      Math.round(totalEffectiveHours * 60),
+    );
+    const remainingMinutes = Math.max(0, targetMinutes - completedMinutes);
+    const outsideMinutes =
+      typeof row.totalBreakDuration === "number"
+        ? Math.max(0, Math.round(row.totalBreakDuration * 60))
+        : 0;
+    const lastOutEpochMs =
+      typeof row.lastOutOfTheDay === "string"
+        ? parseKekaTimestamp(row.lastOutOfTheDay, timeZone)
+        : null;
+    const lastBreakDurationMinutes =
+      typeof row.totalBreakDuration === "number"
+        ? Math.max(0, Math.round(row.totalBreakDuration * 60))
+        : null;
+    const currentlyOutside =
+      lastOutEpochMs != null &&
+      (typeof row.lastInOfTheDay !== "string" || row.lastInOfTheDay == null);
+
+    return {
+      completedMinutes,
+      remainingMinutes,
+      targetMinutes,
+      outsideMinutes,
+      lastOutEpochMs,
+      lastBreakDurationMinutes,
+      currentlyOutside,
+      timeToHomeMinutes: null,
       source: "summary-fields",
     };
   }
 
-  // 3) Generic fallback: attempt to extract effective/inside fields heuristically.
   const completedCandidates: number[] = [];
   const remainingCandidates: number[] = [];
   const targetCandidates: number[] = [];
@@ -279,7 +297,7 @@ export function extractHoursFromSummary(
     lastOutEpochMs: null,
     lastBreakDurationMinutes: null,
     currentlyOutside: false,
-    timeToHomeMinutes,
+    timeToHomeMinutes: null,
     source: "computed-from-fallback",
   };
 }
