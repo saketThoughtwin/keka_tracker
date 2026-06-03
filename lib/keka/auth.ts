@@ -48,67 +48,11 @@ function isExpiringSoon(expiresAt?: number): boolean {
 async function refreshToken(config: KekaConfig): Promise<string> {
   const tokens = getCached(config);
 
-  // Try automatic refresh with client credentials if available
-  if (config.clientId && config.clientSecret) {
-    return refreshTokenWithClientCredentials(config, tokens);
-  }
-
-  // If no client credentials, try using the token endpoint directly with refresh_token
-  // This works for Keka's OAuth2 implementation
-  return refreshTokenWithRefreshToken(config, tokens);
-}
-
-async function refreshTokenWithClientCredentials(
-  config: KekaConfig,
-  tokens: TokenPair
-): Promise<string> {
   const body = new URLSearchParams();
   body.set("grant_type", "refresh_token");
   body.set("refresh_token", tokens.refreshToken);
-  body.set("client_id", config.clientId);
-  body.set("client_secret", config.clientSecret);
 
   try {
-    const { data } = await axios.post<{
-      access_token: string;
-      refresh_token?: string;
-      expires_in?: number;
-    }>(config.tokenUrl, body, {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      timeout: 10000,
-    });
-
-    const expiresAt =
-      data.expires_in != null
-        ? Date.now() + data.expires_in * 1000
-        : decodeJwtExpiry(data.access_token);
-
-    cached = {
-      accessToken: data.access_token,
-      refreshToken: data.refresh_token ?? tokens.refreshToken,
-      expiresAt,
-    };
-    saveTokens(cached);
-    return cached.accessToken;
-  } catch (error) {
-    cached = null;
-    throw new Error(
-      `Token refresh with client credentials failed: ${
-        error instanceof Error ? error.message : "Unknown error"
-      }`
-    );
-  }
-}
-
-async function refreshTokenWithRefreshToken(
-  config: KekaConfig,
-  tokens: TokenPair
-): Promise<string> {
-  try {
-    const body = new URLSearchParams();
-    body.set("grant_type", "refresh_token");
-    body.set("refresh_token", tokens.refreshToken);
-
     const { data } = await axios.post<{
       access_token: string;
       refresh_token?: string;
