@@ -1,5 +1,5 @@
 import axios from "axios";
-import { getValidAccessToken } from "./auth";
+import { getValidAccessToken, forceRefreshToken } from "./auth";
 import type { KekaConfig } from "./config";
 import { extractHoursFromSummary } from "./extract-hours";
 import { formatClock, formatMinutes, todayInTimezone } from "./duration";
@@ -27,25 +27,66 @@ export type AttendanceSnapshot = {
 export async function fetchAttendanceSnapshot(
   config: KekaConfig,
 ): Promise<AttendanceSnapshot> {
-  const accessToken = await getValidAccessToken(config);
+  let accessToken = await getValidAccessToken(config);
   const date = todayInTimezone(config.timezone);
   const nowMs = Date.now();
   const params = { date, attendanceDate: date, fromDate: date, toDate: date };
 
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${accessToken}`,
+  const getHeaders = (token: string): Record<string, string> => ({
+    Authorization: `Bearer ${token}`,
     Accept: "application/json",
     ...config.extraHeaders,
-  };
+  });
 
   if (config.apiKey) {
-    headers["X-API-Key"] = config.apiKey;
+    getHeaders(accessToken)["X-API-Key"] = config.apiKey;
   }
 
-  const response = await axios.get(config.summaryUrl, {
-    headers,
-    params,
-  });
+  try {
+    const response = await axios.get(config.summaryUrl, {
+      headers: getHeaders(accessToken),
+      params,
+    });
+    return processAttendanceResponse(response, config, nowMs, date);
+  } catch (error) {
+    // If we get a 401 (Unauthorized), try refreshing the token and retrying
+    if (
+      axios.isAxiosError(error) &&
+      error.response?.status === 401
+    ) {
+      try {
+        accessToken = await forceRefreshToken(config);
+        const response = await axios.get(config.summaryUrl, {
+          headers: getHeaders(accessToken),
+          params,
+        });
+        return processAttendanceResponse(response, config, nowMs, date);
+      } catch (retryError) {
+        throw new Error(
+          `Failed to fetch attendance after token refresh: ${
+            retryError instanceof Error ? retryError.message : "Unknown error"
+          }`
+        );
+      }
+    } else if (
+      axios.isAxiosError(error) &&
+      error.message === "Token refresh failed"
+    ) {
+      throw new Error(
+        "Cannot refresh token: Make sure KEKA_ACCESS_TOKEN and KEKA_REFRESH_TOKEN " +
+        "are set in .env.local"
+      );
+    }
+    throw error;
+  }
+}
+
+function processAttendanceResponse(
+  response: any,
+  config: KekaConfig,
+  nowMs: number,
+  date: string
+): AttendanceSnapshot {
 
   const { data, status } = response;
   if (status >= 400) {

@@ -1,0 +1,26 @@
+{
+  "updatedAt": "2026-05-28T10:11:20.880Z",
+  "payload": {
+    "data": [
+      {
+        "attendanceDate": "2026-05-28T00:00:00Z",
+        "shiftEffectiveDuration": 8,
+        "validInOutPairs": [
+          {
+            "totalDuration": 1.5
+          }
+        ],
+        "timeEntries": [
+          {
+            "timestamp": "2026-05-28T10:00:00",
+            "punchStatus": 0
+          },
+          {
+            "timestamp": "2026-05-28T11:30:00",
+            "punchStatus": 1
+          }
+        ]
+      }
+    ]
+  }
+}
